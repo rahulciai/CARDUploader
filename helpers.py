@@ -10,7 +10,9 @@ from datetime import datetime, timedelta
 from fastapi import status
 from fastapi.responses import JSONResponse
 from PIL import Image, ImageDraw, ImageFont
+from dotenv import load_dotenv
 from azure.storage.blob import (
+    BlobServiceClient,
     generate_blob_sas,
     BlobSasPermissions,
     ContentSettings,
@@ -18,13 +20,11 @@ from azure.storage.blob import (
 import httpx
 
 from models import ErrorResponse
-from config import (
-    blob_service_client,
-    ACCOUNT_NAME,
-    ACCOUNT_KEY,
-    CONTAINER_NAME,
-    FONTS_DIR,
-)
+
+load_dotenv()
+
+FONTS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fonts")
+_blob_service_client = None
 
 
 # ══════════════════════════
@@ -128,16 +128,37 @@ async def download_image(url: str) -> Image.Image:
 #  BLOB UPLOAD
 # ══════════════════════════
 
+def get_required_env(name: str) -> str:
+    value = os.getenv(name)
+    if not value:
+        raise ValueError(f"{name} environment variable is required.")
+    return value
+
+
+def get_blob_service_client() -> BlobServiceClient:
+    global _blob_service_client
+    if _blob_service_client is None:
+        connection_string = get_required_env("AZURE_CONNECTION_STRING")
+        _blob_service_client = BlobServiceClient.from_connection_string(
+            connection_string
+        )
+    return _blob_service_client
+
+
 def upload_bytes_to_blob(
     image_bytes: bytes,
     ext: str = "png",
     content_type: str = "image/png",
 ) -> str:
+    account_name = get_required_env("ACCOUNT_NAME")
+    account_key = get_required_env("ACCOUNT_KEY")
+    container_name = get_required_env("CONTAINER_NAME")
+
     filename = f"{uuid.uuid4()}.{ext}"
     blob_path = f"images/{filename}"
 
-    blob_client = blob_service_client.get_blob_client(
-        container=CONTAINER_NAME, blob=blob_path
+    blob_client = get_blob_service_client().get_blob_client(
+        container=container_name, blob=blob_path
     )
     blob_client.upload_blob(
         image_bytes,
@@ -146,17 +167,17 @@ def upload_bytes_to_blob(
     )
 
     sas_token = generate_blob_sas(
-        account_name=ACCOUNT_NAME,
-        container_name=CONTAINER_NAME,
+        account_name=account_name,
+        container_name=container_name,
         blob_name=blob_path,
-        account_key=ACCOUNT_KEY,
+        account_key=account_key,
         permission=BlobSasPermissions(read=True),
         expiry=datetime.utcnow() + timedelta(days=3650),
     )
 
     return (
-        f"https://{ACCOUNT_NAME}.blob.core.windows.net/"
-        f"{CONTAINER_NAME}/{blob_path}?{sas_token}"
+        f"https://{account_name}.blob.core.windows.net/"
+        f"{container_name}/{blob_path}?{sas_token}"
     )
 
 

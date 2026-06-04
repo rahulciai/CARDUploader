@@ -1,20 +1,3 @@
-import os
-from dotenv import load_dotenv
-from azure.storage.blob import BlobServiceClient
-
-load_dotenv()
-
-# ── Azure Config ──
-AZURE_CONNECTION_STRING = os.getenv("AZURE_CONNECTION_STRING")
-ACCOUNT_NAME = os.getenv("ACCOUNT_NAME")
-ACCOUNT_KEY = os.getenv("ACCOUNT_KEY")
-CONTAINER_NAME = os.getenv("CONTAINER_NAME")
-
-blob_service_client = BlobServiceClient.from_connection_string(AZURE_CONNECTION_STRING)
-
-# ── Font Dir ──
-FONTS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fonts")
-
 # ── Card Defaults ──
 CARD_DEFAULTS = {
     "birthday": {

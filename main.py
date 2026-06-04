@@ -10,7 +10,7 @@ from models import (
     GenerateRequest,
     GenerateResponse,
 )
-from config import CARD_DEFAULTS
+from card_defaults import CARD_DEFAULTS
 from helpers import (
     error_json,
     download_image,
