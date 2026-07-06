@@ -2,6 +2,7 @@ import base64
 import uuid
 import re
 import os
+from html import unescape
 from io import BytesIO
 from typing import Optional, Tuple
 from urllib.parse import urlparse, urljoin
@@ -9,7 +10,7 @@ from datetime import datetime, timedelta
 
 from fastapi import status
 from fastapi.responses import JSONResponse
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageDraw, ImageFont, ImageOps
 from dotenv import load_dotenv
 from azure.storage.blob import (
     BlobServiceClient,
@@ -27,20 +28,12 @@ FONTS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fonts")
 _blob_service_client = None
 
 
-# ══════════════════════════
-#  ERROR
-# ══════════════════════════
-
 def error_json(status_code: int, message: str) -> JSONResponse:
     return JSONResponse(
         status_code=status_code,
         content=ErrorResponse(error=message).model_dump(),
     )
 
-
-# ══════════════════════════
-#  URL / NETWORK
-# ══════════════════════════
 
 def is_valid_http_url(url: str) -> bool:
     try:
@@ -52,8 +45,13 @@ def is_valid_http_url(url: str) -> bool:
 
 async def fetch_url(url: str) -> httpx.Response:
     headers = {
-        "User-Agent": "Mozilla/5.0",
-        "Accept": "*/*",
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/125.0 Safari/537.36"
+        ),
+        "Accept": "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8",
+        "Referer": url,
     }
     async with httpx.AsyncClient(follow_redirects=True, timeout=30) as client:
         return await client.get(url, headers=headers)
@@ -61,27 +59,54 @@ async def fetch_url(url: str) -> httpx.Response:
 
 def extract_image_url_from_html(html: str, base_url: str) -> Optional[str]:
     patterns = [
-        r'<meta[^>]+property=["\']og:image["\'][^>]+content=["\']([^"\']+)["\']',
-        r'<meta[^>]+name=["\']twitter:image["\'][^>]+content=["\']([^"\']+)["\']',
+        r'<meta[^>]+(?:property|name)=["\']og:image(?::secure_url)?["\'][^>]+content=["\']([^"\']+)["\']',
+        r'<meta[^>]+(?:name|property)=["\']twitter:image(?::src)?["\'][^>]+content=["\']([^"\']+)["\']',
+        r'<meta[^>]+content=["\']([^"\']+)["\'][^>]+(?:property|name)=["\']og:image(?::secure_url)?["\']',
+        r'<meta[^>]+content=["\']([^"\']+)["\'][^>]+(?:name|property)=["\']twitter:image(?::src)?["\']',
         r'<link[^>]+rel=["\']image_src["\'][^>]+href=["\']([^"\']+)["\']',
+        r'<a[^>]+href=["\']([^"\']+\.(?:png|jpe?g|webp|gif|bmp)(?:\?[^"\']*)?)["\']',
         r'<img[^>]+src=["\']([^"\']+)["\']',
+        r'(?:background-image|background)\s*:\s*url\(["\']?([^"\'()]+)["\']?\)',
     ]
     for pattern in patterns:
         match = re.search(pattern, html, flags=re.IGNORECASE)
         if match:
-            raw = match.group(1).strip()
+            raw = unescape(match.group(1).strip())
             if raw and not raw.startswith("data:"):
                 return urljoin(base_url, raw)
     return None
 
 
-# ══════════════════════════
-#  IMAGE DOWNLOAD
-# ══════════════════════════
+def decode_image_bytes(content: bytes) -> Optional[Image.Image]:
+    try:
+        img = Image.open(BytesIO(content))
+        img.load()  
+        img = ImageOps.exif_transpose(img)
+        return img.convert("RGBA")
+    except Exception:
+        pass
 
-async def download_image(url: str) -> Image.Image:
+    for signature in (b"\x89PNG", b"\xff\xd8", b"RIFF"):
+        try:
+            if signature in content:
+                start = content.index(signature)
+                img = Image.open(BytesIO(content[start:]))
+                img.load()
+                img = ImageOps.exif_transpose(img)
+                return img.convert("RGBA")
+        except Exception:
+            pass
+
+    return None
+
+
+
+async def download_image(url: str, depth: int = 0) -> Image.Image:
     if not is_valid_http_url(url):
         raise ValueError("Invalid URL.")
+
+    if depth > 3:
+        raise ValueError("Could not resolve image URL.")
 
     resp = await fetch_url(url)
 
@@ -90,43 +115,20 @@ async def download_image(url: str) -> Image.Image:
 
     content = resp.content
 
-    # Try raw bytes directly
-    try:
-        img = Image.open(BytesIO(content))
-        img.load()
-        return img.convert("RGBA")
-    except Exception:
-        pass
-
-    # Try finding image header inside bytes
-    try:
-        if b"\x89PNG" in content:
-            start = content.index(b"\x89PNG")
-            img = Image.open(BytesIO(content[start:]))
-            img.load()
-            return img.convert("RGBA")
-
-        if b"\xff\xd8" in content:
-            start = content.index(b"\xff\xd8")
-            img = Image.open(BytesIO(content[start:]))
-            img.load()
-            return img.convert("RGBA")
-    except Exception:
-        pass
+    img = decode_image_bytes(content)
+    if img:
+        return img
 
     # Try HTML fallback
+    content_type = resp.headers.get("content-type", "").lower()
     text = resp.text
-    if "<html" in text.lower():
+    if "html" in content_type or "<html" in text.lower() or "<img" in text.lower():
         extracted = extract_image_url_from_html(text, str(resp.url))
         if extracted:
-            return await download_image(extracted)
+            return await download_image(extracted, depth + 1)
 
     raise ValueError("Could not load image from URL.")
 
-
-# ══════════════════════════
-#  BLOB UPLOAD
-# ══════════════════════════
 
 def get_required_env(name: str) -> str:
     value = os.getenv(name)
@@ -181,9 +183,6 @@ def upload_bytes_to_blob(
     )
 
 
-# ══════════════════════════
-#  IMAGE PROCESSING
-# ══════════════════════════
 
 def cover_fit(photo: Image.Image, pw: int, ph: int) -> Image.Image:
     par = photo.width / photo.height
@@ -269,9 +268,6 @@ def draw_centered_text(
         draw.text((x, y), text, font=font, fill=color, anchor="ms")
 
 
-# ══════════════════════════
-#  BASE64 VALIDATION
-# ══════════════════════════
 
 def validate_base64_image(base64_string: str) -> Tuple[bytes, str, str]:
     if "," in base64_string:
@@ -290,18 +286,18 @@ def validate_base64_image(base64_string: str) -> Tuple[bytes, str, str]:
     except Exception as e:
         raise ValueError(f"Base64 decode failed: {str(e)}")
 
-    if image_bytes[:8] == b"\x89PNG\r\n\x1a\n":
-        return image_bytes, "png", "image/png"
-    elif image_bytes[:3] == b"\xff\xd8\xff":
-        return image_bytes, "jpg", "image/jpeg"
-    elif image_bytes[:4] == b"RIFF" and image_bytes[8:12] == b"WEBP":
-        return image_bytes, "webp", "image/webp"
-    else:
-        try:
-            img = Image.open(BytesIO(image_bytes))
-            fmt = (img.format or "PNG").lower()
-            ext = "jpg" if fmt in ("jpg", "jpeg") else fmt
-            ct = f"image/{'jpeg' if ext == 'jpg' else ext}"
-            return image_bytes, ext, ct
-        except Exception:
-            raise ValueError("Invalid image payload.")
+    try:
+        img = Image.open(BytesIO(image_bytes))
+        img.load()
+
+        # Important fix: apply EXIF orientation before upload
+        img = ImageOps.exif_transpose(img)
+
+        # Save normalized image as PNG to remove EXIF orientation dependency
+        buffer = BytesIO()
+        img.convert("RGBA").save(buffer, format="PNG", optimize=True)
+
+        return buffer.getvalue(), "png", "image/png"
+
+    except Exception:
+        raise ValueError("Invalid image payload.")
